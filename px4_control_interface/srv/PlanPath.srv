@@ -1,0 +1,16 @@
+uint8 WAYPOINT_TYPE=0
+uint8 SPIRAL_TYPE=1
+
+uint8 type
+float64 target_x
+float64 target_y
+float64 target_z
+
+int8 num_points
+float64 radius
+float64 height
+int8 loops
+
+---
+bool success
+nav_msgs/Path trajectory
