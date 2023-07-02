@@ -14,6 +14,7 @@ find_package(px4_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
+find_package(px4_control_interface REQUIRED)
 # uncomment the following section in order to fill in
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
@@ -31,6 +32,7 @@ ament_target_dependencies(trajectory_control_server
   geometry_msgs
   nav_msgs
   nav2_msgs
+  px4_control_interface
 )
 set_target_properties(trajectory_control_server PROPERTIES
   CXX_STANDARD 14
@@ -39,6 +41,27 @@ set_target_properties(trajectory_control_server PROPERTIES
 
 # Install executable
 install(TARGETS trajectory_control_server 
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+add_executable(trajectory_planner src/trajectory_planner.cpp)
+ament_target_dependencies(trajectory_planner
+  rclcpp
+  rclcpp_action
+  px4_ros_com
+  px4_msgs
+  geometry_msgs
+  nav_msgs
+  nav2_msgs
+  px4_control_interface
+)
+set_target_properties(trajectory_planner PROPERTIES
+  CXX_STANDARD 14
+  CXX_STANDARD_REQUIRED ON
+)
+
+# Install executable
+install(TARGETS trajectory_planner 
   DESTINATION lib/${PROJECT_NAME}
 )
 
