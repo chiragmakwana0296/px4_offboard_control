@@ -9,15 +9,18 @@ TrajectoryController::TrajectoryController() : Node("trajectory_control_server_n
     offboard_control_mode_publisher_ = this->create_publisher<px4_msgs::msg::OffboardControlMode>("/fmu/in/offboard_control_mode", 10);
     trajectory_setpoint_publisher_ = this->create_publisher<px4_msgs::msg::TrajectorySetpoint>("/fmu/in/trajectory_setpoint", 10);
     vehicle_command_publisher_ = this->create_publisher<px4_msgs::msg::VehicleCommand>("/fmu/in/vehicle_command", 10);
-    odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
-      "/fmu/out/vehicle_odometry", 10, std::bind(&TrajectoryController::odomCallback, this, std::placeholders::_1));
-
+    
+    rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
+    auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 5), qos_profile);
+    
+    odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleLocalPosition>(
+      "/fmu/out/vehicle_local_position", qos, std::bind(&TrajectoryController::odomCallback, this, std::placeholders::_1));
 
     this->declare_parameter<double>("linear_gain", 0.50);
     this->declare_parameter<double>("angular_gain", 0.50);
     this->declare_parameter<double>("vertical_gain", 0.50);
     this->declare_parameter<double>("controller_rate", 10.0);
-    this->declare_parameter<double>("goal_reach_tol", 0.01);
+    this->declare_parameter<double>("goal_reach_tol", 0.5);
     this->declare_parameter<double>("max_linear_velocity", 1.0);
     this->declare_parameter<double>("max_angular_velocity", 2.0);
     this->declare_parameter<double>("max_linear_acceleration", 0.1);
@@ -73,15 +76,34 @@ void TrajectoryController::execute(const std::shared_ptr<GoalHandleFollowPath> g
 
     auto result = std::make_shared<FollowPath::Result>();
     auto feedback = std::make_shared<FollowPath::Feedback>();
-    // auto path = std::make_shared<FollowPath::Goal>();
-
     auto path = goal_handle->get_goal();
+
+    if(path->path.poses.size() == 0){
+      RCLCPP_INFO(this->get_logger(), "Path Empty ! canceling action call ");
+      goal_handle->canceled(result);
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Executing goal");
     auto trajectory_ = path->path.poses;
-    size_t current_trajectory_index = 0;
+    auto path_ned = nav_msgs::msg::Path();
+    path_ned.poses.clear();
+    for(auto pose_ : trajectory_){
+        Eigen::Vector3d pose_enu;
+        pose_enu << pose_.pose.position.x, 
+                            pose_.pose.position.y, 
+                            pose_.pose.position.z;
+        Eigen::Vector3d pose_ned = px4_ros_com::frame_transforms::
+                                        transform_static_frame(pose_enu, px4_ros_com::frame_transforms::StaticTF::ENU_TO_NED);
 
-    while (rclcpp::ok() && current_trajectory_index < trajectory_.size())
+        auto pose = geometry_msgs::msg::PoseStamped();
+        pose.pose.position.x = pose_ned.x();
+        pose.pose.position.y = pose_ned.y();
+        pose.pose.position.z = pose_ned.z();
+        path_ned.poses.push_back(pose);
+    }
+
+    while (rclcpp::ok())
     {   
-
         this->get_parameter("linear_gain", linear_gain_);
         this->get_parameter("angular_gain", angular_gain_);
         this->get_parameter("vertical_gain", vertical_gain_);
@@ -92,75 +114,206 @@ void TrajectoryController::execute(const std::shared_ptr<GoalHandleFollowPath> g
         this->get_parameter("max_linear_acceleration", max_linear_acceleration_);
         this->get_parameter("max_linear_deceleration", max_linear_deceleration_);
         this->get_parameter("add_acce_deccl_limits", add_acce_deccl_limits_);
-
-        const geometry_msgs::msg::PoseStamped& current_trajectory_point = trajectory_[current_trajectory_index];
-        Eigen::Quaterniond q_ned;
-        q_ned.coeffs() << odometry_ned_->q[0], odometry_ned_->q[1],odometry_ned_->q[2],odometry_ned_->q[3];
-
-        Eigen::Vector3d current_goal_enu;
-        current_goal_enu << current_trajectory_point.pose.position.x, 
-                        current_trajectory_point.pose.position.y, 
-                        current_trajectory_point.pose.position.z;
-
-        Eigen::Vector3d current_goal_ned = px4_ros_com::frame_transforms::
-                                        transform_static_frame(current_goal_enu, px4_ros_com::frame_transforms::StaticTF::ENU_TO_NED);
-
-        double x_error = current_goal_ned.x() - odometry_ned_->position[0];
-        double y_error = current_goal_ned.y() - odometry_ned_->position[1];
-        double z_error = current_goal_ned.z() - odometry_ned_->position[2];
         
-        double distance_to_point = std::hypot(x_error, y_error, z_error);
-
-        if (distance_to_point <= goal_reach_tol_)
+        if (current_pose_ned_ != nullptr)
         {
-            current_trajectory_index++;
-            continue;
+          std::pair<geometry_msgs::msg::Point, double> target_wp = findTargetPoint(*current_pose_ned_, path_ned);
+          
+          auto target_point = target_wp.first;
+          double distance_remaining = calculateDistance(current_pose_ned_->position, path_ned.poses.back().pose.position); //target_wp.second;
+
+          double lookahead_curvature = calculateLookaheadCurvature(target_point, current_pose_ned_->position);
+
+          // angular_velocity_ = linear_velocity_*lookahead_curvature;
+
+          double steering_angle = calculateSteeringAngle(current_pose_ned_->position, current_heading_ned_, target_point);
+
+          // geometry_msgs::msg::Twist cmd_vel = calculateControlCommand(*current_pose_ned_, target_point);
+
+          if(true){
+            RCLCPP_INFO_STREAM(this->get_logger(), "steering_angle " << steering_angle);
+            RCLCPP_INFO_STREAM(this->get_logger(), "distance_remaining " << distance_remaining);
+            RCLCPP_INFO_STREAM(this->get_logger(), "angular_velocity_ " << lookahead_curvature << " linear_velocity_ " << linear_velocity_);
+            RCLCPP_INFO_STREAM(this->get_logger(), "lookahead_curvature " << lookahead_curvature);
+            RCLCPP_INFO_STREAM(this->get_logger(), "target_point " << target_point.x << " " << target_point.y << " " << target_point.z);
+          }
+
+          publish_offboard_control_mode();
+          auto trajectory_setpoint_msg = std::make_unique<px4_msgs::msg::TrajectorySetpoint>();
+          trajectory_setpoint_msg->position[0] = target_point.x;
+          trajectory_setpoint_msg->position[1] = target_point.y;
+          trajectory_setpoint_msg->position[2] = target_point.z;
+          // trajectory_setpoint_msg->velocity[0] = cmd_vel.linear.x;
+          // trajectory_setpoint_msg->velocity[1] = cmd_vel.linear.y;
+          // trajectory_setpoint_msg->velocity[2] = cmd_vel.linear.z;
+          // trajectory_setpoint_msg->acceleration = ;
+          // trajectory_setpoint_msg->yaw = steering_angle; // [-PI:PI]
+          // trajectory_setpoint_msg->yawspeed = angular_velocity_; // [-PI:PI]
+          trajectory_setpoint_msg->timestamp = this->get_clock()->now().nanoseconds() / 1000;
+          trajectory_setpoint_publisher_->publish(std::move(trajectory_setpoint_msg));
+
+          feedback->distance_to_goal = distance_remaining;
+          goal_handle->publish_feedback(feedback);
+
+          if(distance_remaining <= 2.0){
+            goal_handle->succeed(result);
+            RCLCPP_INFO(this->get_logger(), "Goal reached !");
+            return;
+          }
         }
 
-        
+        if (goal_handle->is_canceling())
+        {
+          RCLCPP_INFO(this->get_logger(), "Goal canceled !");
+          goal_handle->canceled(result);
+          return;
+        }
 
-        // px4_ros_com::frame_transforms::
-        //                 utils::quaternion::transform_orientation(q_ned, StaticTF::NED_TO_ENU);
-        
-        current_yaw_ = px4_ros_com::
-                        frame_transforms::
-                        utils::quaternion::quaternion_get_yaw(q_ned);
-
-        double desired_heading = std::atan2(y_error, x_error);
-        
-        double yaw_error = desired_heading - current_yaw_;
-
-        double linear_velocity = linear_gain_ * distance_to_point;
-        double angular_velocity = angular_gain_ * yaw_error;
-        
-        // Calculate velocity vector components
-        double vx = linear_velocity * std::cos(current_yaw_);
-        double vy = linear_velocity * std::sin(current_yaw_);
-        double vz = vertical_gain_ * z_error;
-
-
-        publish_offboard_control_mode();
-        auto trajectory_setpoint_msg = std::make_unique<px4_msgs::msg::TrajectorySetpoint>();
-        trajectory_setpoint_msg->position[0] = current_goal_ned.x();
-        trajectory_setpoint_msg->position[1] = current_goal_ned.y();
-        trajectory_setpoint_msg->position[2] = current_goal_ned.z();
-        trajectory_setpoint_msg->velocity[0] = vx;
-        trajectory_setpoint_msg->velocity[1] = vy;
-        trajectory_setpoint_msg->velocity[2] = vz;
-        // trajectory_setpoint_msg->acceleration = ;
-        trajectory_setpoint_msg->yaw = desired_heading; // [-PI:PI]
-        trajectory_setpoint_msg->yawspeed = angular_velocity; // [-PI:PI]
-        trajectory_setpoint_msg->timestamp = this->get_clock()->now().nanoseconds() / 1000;
-        trajectory_setpoint_publisher_->publish(std::move(trajectory_setpoint_msg));
         rate.sleep();
     }
 
 }
 
-void TrajectoryController::odomCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg){
-    odometry_ned_ = msg;
+geometry_msgs::msg::Twist TrajectoryController::calculateControlCommand(const geometry_msgs::msg::Pose &current_pose,
+                                                    const geometry_msgs::msg::Point &target_point) {
+    // Calculate the desired linear velocity
+    double linear_velocity = 1.0;  // Set the desired linear velocity in m/s
 
-    
+    // Calculate the desired velocity vector
+    Eigen::Vector3d desired_velocity(target_point.x - current_pose.position.x,
+                                     target_point.y - current_pose.position.y,
+                                     target_point.z - current_pose.position.z);
+    desired_velocity.normalize();
+    desired_velocity *= linear_velocity;
+
+    // Calculate the desired position error
+    Eigen::Vector3d position_error(target_point.x - current_pose.position.x,
+                                   target_point.y - current_pose.position.y,
+                                   target_point.z - current_pose.position.z);
+
+    // Calculate the desired velocity error
+    Eigen::Vector3d velocity_error(desired_velocity.x() - current_pose.orientation.x,
+                                   desired_velocity.y() - current_pose.orientation.y,
+                                   desired_velocity.z() - current_pose.orientation.z);
+
+    // Calculate the desired control command
+    geometry_msgs::msg::Twist cmd_vel;
+    cmd_vel.linear.x = desired_velocity.x() + position_error.x() + velocity_error.x();
+    cmd_vel.linear.y = desired_velocity.y() + position_error.y() + velocity_error.y();
+    cmd_vel.linear.z = desired_velocity.z() + position_error.z() + velocity_error.z();
+
+    return cmd_vel;
+  }
+
+
+double TrajectoryController::calculateSteeringAngle(const geometry_msgs::msg::Point &current_pose, double current_heading,
+                                const geometry_msgs::msg::Point &target_point) {
+    // Calculate the heading angle in ned
+    double target_heading_angle = std::atan2(target_point.y - current_pose.y,
+                                 target_point.x - current_pose.x);
+
+    // Calculate the angle difference
+    double angle_difference = target_heading_angle - current_heading; // tf2::getYaw(current_pose.orientation);
+
+    // Normalize the angle difference to the range [-pi, pi]
+    angle_difference = std::atan2(std::sin(angle_difference), std::cos(angle_difference));
+
+    // Calculate the steering angle
+    double steering_angle = 2.0 * angle_difference;
+
+    return steering_angle;
+  }
+
+double TrajectoryController::calculateTrajectoryLength(const nav_msgs::msg::Path& path) {
+  double length = 0.0;
+  for (size_t i = 0; i < path.poses.size() - 1; ++i) {
+    const geometry_msgs::msg::Point& p1 = path.poses[i].pose.position;
+    const geometry_msgs::msg::Point& p2 = path.poses[i + 1].pose.position;
+    double segment_length = calculateDistance(p1, p2);
+    length += segment_length;
+  }
+  return length;
+}
+
+std::pair<geometry_msgs::msg::Point, double> TrajectoryController::findTargetPoint(const geometry_msgs::msg::Pose &current_pose,
+                                            const nav_msgs::msg::Path &path) {
+    double min_distance = std::numeric_limits<double>::max();
+    geometry_msgs::msg::Point target_point;
+    geometry_msgs::msg::Point curr_target_point;
+
+    size_t index = 0;
+    // Find the closest point to the current pose
+    for (size_t i = 0; i < path.poses.size(); ++i) {
+      double distance = calculateDistance(current_pose.position, path.poses[i].pose.position);
+
+      if (distance < min_distance) {
+        min_distance = distance;
+        target_point = path.poses[i].pose.position;
+        index = i;
+      }
+    }
+
+    // Calculate the lookahead distance
+    double lookahead_distance = std::max(lookahead_distance_, min_distance);
+    double distance_traveled{0.0};
+    // Find the target point within the lookahead distance
+    for (size_t i = index; i < path.poses.size(); ++i) {
+      double distance = calculateDistance(current_pose.position, path.poses[i].pose.position);
+      distance_traveled += distance;
+      if (distance >= lookahead_distance) {
+        target_point = path.poses[i+1].pose.position;
+        index = i;
+        break;
+      }
+    }
+
+    RCLCPP_INFO_STREAM(this->get_logger(), "current index: " << index);
+
+    double distance_remaining = calculateTrajectoryLength(path) - distance_traveled;
+    std::pair<geometry_msgs::msg::Point, double> out;
+    out.first = target_point;
+    out.second = distance_remaining;
+    // if(index == path.poses.size()-2){
+    // } else{
+    //   out.second = false;
+    // }
+    return out;
+
+  }
+
+double TrajectoryController::calculateLookaheadCurvature(const geometry_msgs::msg::Point &target_point, const geometry_msgs::msg::Point &current_point){
+    double distance = calculateDistance(target_point, current_point);
+    double dist2 = distance*distance;
+    if (dist2 > 0.001) {
+        return 2.0 * target_point.x / dist2;
+    } else {
+        return 0.0;
+    }
+}
+
+  double TrajectoryController::calculateDistance(const geometry_msgs::msg::Point &point1, const geometry_msgs::msg::Point &point2) {
+    double dx = point2.x - point1.x;
+    double dy = point2.y - point1.y;
+    double dz = point2.z - point1.z;
+    return sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+
+void TrajectoryController::odomCallback(const px4_msgs::msg::VehicleLocalPosition::UniquePtr msg){
+    if (!current_pose_ned_) {
+        current_pose_ned_ = std::make_shared<geometry_msgs::msg::Pose>();
+    }
+    if (!current_vel_ned_) {
+        current_vel_ned_ = std::make_shared<geometry_msgs::msg::Twist>();
+    }    
+    current_pose_ned_->position.x = msg->x;
+    current_pose_ned_->position.y = msg->y;
+    current_pose_ned_->position.z = msg->z;
+    current_vel_ned_->linear.x = msg->vx;
+    current_vel_ned_->linear.y = msg->vy;
+    current_vel_ned_->linear.z = msg->vz;
+    current_heading_ned_ = msg->heading;
+
 }
 
 void TrajectoryController::arm()
