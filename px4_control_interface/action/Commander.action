@@ -1,0 +1,11 @@
+string command
+float64 param1
+float64 param2
+int32 retry
+int32 rate
+---
+bool result
+string message
+---
+int8 retry
+ 

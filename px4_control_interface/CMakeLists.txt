@@ -17,6 +17,7 @@ find_package(builtin_interfaces REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
 "srv/PlanPath.srv"
+"action/Arming.action"
 DEPENDENCIES builtin_interfaces std_msgs nav_msgs
 )
 
