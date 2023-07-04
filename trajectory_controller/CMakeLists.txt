@@ -65,6 +65,29 @@ install(TARGETS trajectory_planner
   DESTINATION lib/${PROJECT_NAME}
 )
 
+
+add_executable(commander_action src/commander_action.cpp)
+ament_target_dependencies(commander_action
+  rclcpp
+  rclcpp_action
+  px4_ros_com
+  px4_msgs
+  geometry_msgs
+  nav_msgs
+  nav2_msgs
+  px4_control_interface
+)
+set_target_properties(commander_action PROPERTIES
+  CXX_STANDARD 14
+  CXX_STANDARD_REQUIRED ON
+)
+
+# Install executable
+install(TARGETS commander_action 
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+
 # Install launch files
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
